@@ -325,8 +325,10 @@ class Repository:
 # ==============================================
 # CLI Entry Point
 # ==============================================
+
+
 def main():
-    parser = argparse.ArgumentParser(description="gitpy")
+    parser = argparse.ArgumentParser(description="gitpy")  
     subparsers = parser.add_subparsers(dest='command')
 
     # init command
