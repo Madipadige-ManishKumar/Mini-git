@@ -150,7 +150,7 @@ class Repository:
         self.index = self.gitdir / "index"
         self.head_dir = self.refs / "heads"
 
-    def init(self):
+    def init(self): 
         if self.gitdir.exists():
             return False
         self.gitdir.mkdir()
@@ -320,7 +320,107 @@ class Repository:
         self.save_index({})
         print(f"Committed to {current_branch} with commit {commit_hash}")
         return commit_hash
+    def get_files_from_tree_recursive(self, tree_hash: str,prefix :str ="") -> set:
+        files = set()
+        try:
+            tree_object = self.load_object(tree_hash)
+            tree = Tree.from_content(tree_object.content)
 
+            for mode, name, obj_hash in tree.entries:
+                fullname = f"{prefix}{name}" 
+                if mode.startswith('100'):
+                    files.add(fullname)
+                elif mode.startswith('400'):
+                    subtree_files = self.get_files_from_tree_recursive(obj_hash,f"{fullname}/")
+                    files.update(subtree_files)
+
+            pass
+        except Exception as e:
+            print("could not get files from tree")
+        return files
+        pass
+    def checkout(self, branch: str, create_branch: bool = False):
+        branch_file = self.head_dir/ branch
+        previous_branch_file = self.get_current_branch()
+        files_to_clear =set()
+            #  Calculate files to clear from previous branch
+        try:
+            previous_commit_hash = self.get_branch_commit(previous_branch_file)
+
+            if previous_commit_hash:
+                previous_commit_object = self.load_object(previous_commit_hash)
+                previous_commit = Commit.from_content(previous_commit_object.content)
+                if previous_commit.tree_hash:
+                    files_to_clear = self.get_files_from_tree_recursive(previous_commit.tree_hash)
+                pass
+        except Exception as e:
+            files_to_clear = set()
+            pass
+        if not branch_file.exists():
+            if create_branch:
+                
+                if previous_commit_hash:
+                    self.set_branch_commit(branch, previous_commit_hash)
+                    print(f"Created and switched to new branch {branch}")
+                else:
+                    print(f"No commit found for branch {previous_branch_file}")
+                    return
+                # self.head_dir.write_text(f"ref: refs/heads/{branch}\n")
+                self.head.write_text(f"ref: refs/heads/{branch}\n")
+            else:
+                print(f"Branch {branch} does not exist")
+                print(f"use python main.py checkout -b{branch} to create a new branch")
+                return 
+        self.head.write_text(f"ref: refs/heads/{branch}\n")
+                # Clear files from previous branch
+        self.restoring_working_directory(branch,files_to_clear)
+        print(f"Switched to branch {branch}")
+    def restoring_working_directory(self,branch:str,files_to_clear:set[str]):
+        target_commit_hash = self.get_branch_commit(branch)
+        if not target_commit_hash:
+            print(f"No commit found for branch {branch}")
+            return
+        for rel_path in files_to_clear:
+            try:
+                full_path = self.path / rel_path
+                if full_path.exists():
+                    if full_path.is_file():
+                        full_path.unlink()
+                    elif full_path.is_dir():
+                        for sub in full_path.rglob('*'):
+                            if sub.is_file():
+                                sub.unlink()
+                        full_path.rmdir()
+            except Exception as e:
+                print(f"Could not remove {rel_path}: {e}")
+        target_commit_object = self.load_object(target_commit_hash)
+        target_commit = Commit.from_content(target_commit_object.content)
+        if target_commit.tree_hash:
+            self.restore_tree(target_commit.tree_hash,self.path)
+        self.save_index({})
+
+    def restore_tree(self,tree_hash:str,path:Path):
+        
+        try:
+            tree_object = self.load_object(tree_hash)
+            tree = Tree.from_content(tree_object.content)
+
+            for mode, name, obj_hash in tree.entries:
+                file_path = path/name
+                if mode.startswith('100'):
+                    blob_obj = self.load_object(obj_hash)
+                    blob = Blob(blob_obj.content)
+                    file_path.write_bytes(blob.content)
+                    pass
+                elif mode.startswith('400'):
+                    file_path.mkdir(exist_ok=True)
+                    subtree_files = self.restore_tree(obj_hash,file_path)
+            pass
+        except Exception as e:
+            print("could not get files from tree")
+        return 
+            
+        
 
 # ==============================================
 # CLI Entry Point
@@ -341,6 +441,12 @@ def main():
     # commit command
     commit_parser = subparsers.add_parser('commit', help='Commit changes')
     commit_parser.add_argument("-m", "--message", required=True, help="Commit message")
+
+    #checkout Command
+
+    checkout_parser = subparsers.add_parser('checkout', help='Checkout a commit')
+    checkout_parser.add_argument("branch", help="Branch or commit to checkout")
+    checkout_parser.add_argument("-b","--create-branch",action="store_true",help="Create a new branch")
 
     args = parser.parse_args()
     if not args.command:
@@ -363,6 +469,11 @@ def main():
                 print("Not a gitpy repository")
                 return
             repo.commit(args.message, "Gitpy User")
+        elif args.command == "checkout":
+            if not repo.gitdir.exists():
+                print("Not a gitpy repository")
+                return
+            repo.checkout(args.branch, args.create_branch)
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
