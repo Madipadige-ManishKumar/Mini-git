@@ -1,0 +1,124 @@
+WORKING.TXT - Command -> Code mapping for `main.py`
+
+This file explains, for each CLI command supported by `main.py`, which parts of the code are executed and the sequence of operations performed. Use these as a quick reference to understand how `main.py` dispatches work into the `Repository` class and object classes (`Blob`, `Tree`, `Commit`, `GitObject`).
+
+---
+
+Command: `python main.py init`
+- Purpose: initialize a new repository in the current directory.
+- Execution path and functions called:
+	- `main()` (module-level): argparse chooses `init` branch and instantiates `Repository()`.
+	- `Repository.init()` is invoked.
+		- Creates directory `.gitpy` and subdirectories: `.gitpy/objects`, `.gitpy/refs`, `.gitpy/refs/heads`.
+		- Initializes `HEAD` file with `ref: refs/heads/main\n` by writing `self.head.write_text("ref: refs/heads/main\n")`.
+		- Calls `save_index({})` to create an empty `.gitpy/index` file (writes JSON `{}` with indent=2).
+	- Printed output: "Initialized empty gitpy repository" on success; if `.gitpy` already exists, `init()` returns False and `main()` prints "Repository already exists".
+
+Files/objects created:
+- `.gitpy/` directory tree
+- `.gitpy/HEAD` (contains ref to branch)
+- `.gitpy/index` (empty JSON index)
+
+---
+
+Command: `python main.py add <path> [<path> ...]`
+- Purpose: add one or more files or directories to the repository index, storing file contents as `blob` objects.
+- Execution path and functions called:
+	- `main()` parses `add` and builds `Repository()`; it first checks `repo.gitdir.exists()` and prints "Not a gitpy repository" if missing.
+	- For each path argument `p`, `main()` calls `repo.add_path(p)`.
+	- `Repository.add_path(path)`:
+		- Resolves `fullpath = self.path / path` and checks existence.
+		- If a file: calls `Repository.add_file(path)`.
+		- If a directory: calls `Repository.add_directory(path)`.
+
+	- `Repository.add_file(path)`:
+		- Reads bytes from the file (`full_path.read_bytes()`).
+		- Creates `Blob(content)` (subclass of `GitObject` with type `'blob'`).
+		- Calls `Repository.store_object(blob)`:
+			- `GitObject.hash()` builds header `"blob <len>\0" + content` and returns SHA-1 hex.
+			- `GitObject.serialize()` compresses `header + content` with `zlib.compress(...)` and returns bytes.
+			- `store_object()` creates `.gitpy/objects/<first2>` directory and writes the compressed bytes to file named by the remaining hex chars.
+		- Updates the index dict via `load_index()`, sets `index[path] = blob_hash`, then `save_index(index)`.
+		- Prints `Added <path>`.
+
+	- `Repository.add_directory(path)`:
+		- Recursively iterates files under the given directory (`rglob('*')`), skipping anything under `.gitpy`.
+		- For each file, does the same `Blob` -> `store_object()` -> update index flow and counts files added.
+		- Saves index and prints `Added <count> files from directory <path>`.
+
+Output and side effects:
+- `.gitpy/objects/` receives new object files (zlib-compressed blobs) organized by hash prefix.
+- `.gitpy/index` is updated to map each added relative path to its blob hash.
+
+---
+
+Command: `python main.py commit -m "message"`
+- Purpose: commit the current index state into a new commit object, build tree objects from the index, and update the current branch ref.
+- Execution path and functions called:
+	- `main()` parses `commit`, creates `Repository()` and checks `repo.gitdir.exists()`.
+	- Calls `repo.commit(args.message, "Gitpy User")`.
+
+	- `Repository.commit(message, author)` sequence:
+		1. `tree_hash = self.create_tree_from_index()`
+			 - `create_tree_from_index()` loads index (`load_index()`).
+			 - If index empty, returns hash of an empty `Tree()` stored via `store_object()`.
+			 - Otherwise it splits index entries into top-level files and nested directories, builds nested dictionaries representing directories, then calls `create_tree_recursive(entries)`:
+				 - `create_tree_recursive()` creates a `Tree()` object, and for each entry:
+					 - If entry is a file (blob hash string): `tree.add_entry('100644', name, blob_hash)`.
+					 - If entry is a subdirectory (dict): recursively build subtree, get `sub_tree_hash`, and `tree.add_entry('40000', name, sub_tree_hash)`.
+				 - Each `Tree()` created is serialized (`Tree._serialize_entries()`), and `store_object(tree)` writes the tree object to `.gitpy/objects` and returns its hash.
+			 - The root tree hash is returned to `commit()`.
+
+		2. Determine current branch and parent commit:
+			 - `current_branch = self.get_current_branch()` reads `.gitpy/HEAD` (if it contains `ref: refs/heads/<name>`, returns `<name>`).
+			 - `parent_commit = self.get_branch_commit(current_branch)` reads `.gitpy/refs/heads/<branch>` (returns commit hash or None).
+
+		3. If there is a parent commit, the code loads it to compare:
+			 - `parent_git_commit_obj = self.load_object(parent_commit)` -> `GitObject.deserialize()` -> returns `GitObject` with `.type` and `.content`.
+			 - `parent_commit_data = Commit.from_content(parent_git_commit_obj.content)` parses the commit content and exposes `tree_hash`.
+			 - If `tree_hash == parent_commit_data.tree_hash`, the commit detects no changes and prints "No changes to commit (Up to date)" and returns.
+
+		4. Otherwise build and store the new commit:
+			 - `commit_obj = Commit(tree_hash, parent_hashes, author, committer, message)` which constructs commit content via `_serialize_commit()` including `tree`, `parent` lines, `author`/`committer` with timestamp, blank line, and message.
+			 - `commit_hash = self.store_object(commit_obj)` writes the compressed commit object to `.gitpy/objects`.
+			 - `self.set_branch_commit(current_branch, commit_hash)` writes the commit hash to `.gitpy/refs/heads/<branch>`.
+			 - `self.save_index({})` clears the index (staging area).
+			 - Prints `Committed to <branch> with commit <hash>` and returns the hash.
+
+Side effects:
+- New `tree` and `commit` objects stored under `.gitpy/objects`.
+- `.gitpy/refs/heads/<branch>` updated to point at the new commit.
+- `.gitpy/index` cleared.
+
+---
+
+Command: `python main.py` (no args)
+- Purpose: show help text.
+- Execution path: `main()` calls `parser.print_help()` and returns. No repository state changes.
+
+---
+
+Error handling (common for all commands)
+- `main()` wraps command handling in a try/except. If any method raises an Exception (file not found, object missing, invalid path), `main()` prints `Error: <message>` and calls `sys.exit(1)`.
+- Many repository methods also raise explicit Exceptions for missing files or invalid paths (e.g., `add_file`, `add_directory`, `load_object`).
+
+---
+
+Important helper classes and functions referenced above
+- `GitObject`:
+	- `hash()` — compute sha1 over `"{type} {len(content)}\0" + content`.
+	- `serialize()` — zlib.compress(header + content) used for writing object files.
+	- `deserialize()` — zlib.decompress, split header and content, return `GitObject(type, content)`.
+
+- `Blob` — `GitObject` subclass representing file contents.
+- `Tree` — stores entries `(mode, name, hash)` and serializes entries as `"mode name\0" + raw20bytes(hash)`. Parsed by `Tree.from_content()`.
+- `Commit` — stores `tree`, zero-or-more `parent` lines, `author`, `committer`, message, timestamp; `from_content()` parses it back.
+
+---
+
+If you want, I can now:
+- Run `python main.py init` in this workspace and show the resulting `.gitpy` tree.
+- Overwrite or append these explanations into `README.md` or convert to markdown.
+- Expand any of the command sections with line-level references (e.g., exact method names & line numbers).
+
+END OF FILE
